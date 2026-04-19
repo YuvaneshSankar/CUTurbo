@@ -1,5 +1,4 @@
-# Claude Code
-.claude/
+
 
 # IDE / editor
 .vscode/
@@ -40,3 +39,7 @@ env/
 
 # Dataset caches (downloaded on demand)
 .cache/
+
+
+# Claude Code
+.claude/

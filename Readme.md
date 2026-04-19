@@ -123,11 +123,60 @@ One `.cu` file (`csrc/turboquant_kernels.cu`), JIT-compiled through `torch.utils
 | `fwht_forward`, `fwht_inverse` | In-place O(d log d) Walsh-Hadamard transform with a random sign flip | Structured stand-in for a Haar-random `Π`. Same concentration behaviour as a dense `d × d` GEMM but ~10× fewer FLOPs. Used by QuIP#, HadaCore. |
 | `quantize_pack<B>` (templated on `B ∈ {1, 2, 4}`) | Per-coord argmin over the Lloyd codebook, then bit-packs `32/B` indices per `uint32` word | Shared-mem staging keeps the pack reduction warp-local and writes one coalesced word per group. `B` is a template param so the compiler unrolls the centroid scan. |
 | `unpack_dequantize<B>` | Reverse: unpack `B` bits → codebook lookup → fp32 | Same block layout as `quantize_pack` so the caller can run `fwht_inverse` on the output in-place. |
+| `fused_quantize<B>` | **Fusion of `fwht_forward` + `quantize_pack` into one kernel.** Keeps the rotated `y` in shared memory between the FWHT butterflies and the centroid search, skipping an HBM round-trip. | Default path since this change. See the next section for the measured speedup. |
+| `fused_dequantize<B>` | **Fusion of `unpack_dequantize` + `fwht_inverse` into one kernel.** Keeps the unpacked `y_hat` in shared memory across the codebook lookup and the inverse butterflies. | Default path since this change. |
 | `pack_signs`, `unpack_signs` | 1-bit sign packing for the QJL residual | Used only by the prod variant. |
 
 `TurboQuant_prod` additionally invokes a dense `S · r` projection via cuBLAS (`torch.matmul`); writing a competitive GEMM from scratch is out of scope, and the Gaussian matrix is rotation-agnostic.
 
 **Rotation choice.** The paper's analysis assumes a Haar-random `Π`. Practical systems (QuIP#, HadaCore) replace it with the structured factorisation `Π = (1/√d) · H · diag(s)` where `H` is the `d × d` Walsh-Hadamard matrix and `s ∈ {±1}ᵈ` are random signs. This is what we implement. The distortion numbers below land exactly on the paper's theoretical bounds, so the structured approximation is sufficient.
+
+---
+
+## Kernel fusion (fused FWHT + quantize-pack)
+
+The MSE quantize pipeline is two kernels, with the rotated intermediate `y` round-tripped through HBM:
+
+```
+  UNFUSED (two kernels):
+    x ─► fwht_forward  ─► [HBM: y, N·d·4 B written] ─► quantize_pack ─► packed
+```
+
+Fusion keeps `y` in shared memory across both stages:
+
+```
+  FUSED (one kernel):
+    x ─► {fwht_forward · quantize_pack}  ─► packed
+```
+
+Same for the reverse direction (`unpack_dequantize` + `fwht_inverse`). This saves one kernel launch and the HBM round-trip of the intermediate tensor: **64 MiB per call at `d = 128, N = 65 536`**, scaling linearly with `N·d`.
+
+The fused kernel is **bit-exact with the unfused path** — the centroid indices produced by `fused_quantize` are `torch.equal(...)` to those produced by `fwht_forward`+`quantize_pack`, and the reconstructed `x_hat` is identical to machine precision. Verified by `benchmark/smoke_test.py::check_fused_equivalence` across `b ∈ {1, 2, 4}`.
+
+### Measured speedup
+
+Median latency (100 iters after 15 warmup, CUDA events), fused-vs-unfused at the production config (d=128, KV-cache-shaped) and a range of other shapes:
+
+| config | direction | unfused (µs) | fused (µs) | **speedup** | HBM saved |
+|---|---|---|---|---|---|
+| d=128, N=65 536, b=2 | quantize | 1141.8 | 996.4 | **1.15×** | 64 MiB |
+| d=128, N=65 536, b=2 | dequantize | 1116.7 | 832.5 | **1.34×** | 64 MiB |
+| d=128, N=65 536, b=4 | quantize | 1375.2 | 1233.9 | 1.12× | 64 MiB |
+| d=128, N=65 536, b=4 | dequantize | 1195.0 | 943.1 | **1.27×** | 64 MiB |
+| d=128, N=262 144, b=2 | quantize | 5700.1 | 4773.9 | 1.19× | 256 MiB |
+| d=128, N=262 144, b=2 | dequantize | 5219.8 | 3909.6 | **1.34×** | 256 MiB |
+| d=256, N=262 144, b=1 | quantize | 14 756.9 | 11 786.8 | 1.25× | 512 MiB |
+| d=256, N=262 144, b=1 | dequantize | 12 183.6 | 9 837.6 | 1.24× | 512 MiB |
+| d=512, N=65 536, b=2 | quantize | 6 548.0 | 5 194.2 | **1.26×** | 256 MiB |
+| d=512, N=65 536, b=2 | dequantize | 6 858.2 | 4 851.7 | **1.41×** | 256 MiB |
+
+Full sweep in `results/fusion/summary.csv`. Summary across all 15 configs: **quantize speedup median 1.11× (range 0.96–1.26×); dequantize speedup median 1.29× (range 1.17–1.41×)**. Dequantize benefits more because it does less compute per coord (codebook-lookup is a single load vs a 2^B-way argmin), so shaving the HBM round-trip is a bigger fraction of the runtime.
+
+![Fusion speedup](results/fusion/fig_fusion_speedup.png)
+
+**Transitive speedup for `TurboQuant_prod`.** The prod variant's internal `TurboQuantMSE` uses the fused path by default, so Algorithm 2 gets the same acceleration on its MSE stages at no additional cost. The `S · r` cuBLAS GEMM and the `pack_signs` kernel are unchanged.
+
+**Caveat — `__fmul_rn` for bit-exact parity.** The unfused pipeline stores the scaled `y` to HBM between kernels, which forces fp32 rounding. The fused version keeps `y` in registers, where `--use_fast_math` lets nvcc fuse the scale-multiply with the downstream subtraction into a single-rounding FMA. For one input per ~4 M at `b=4` the FMA rounding flipped the argmin at a codebook midpoint. We pin the scaling multiplication with `__fmul_rn` to force separate rounding, restoring bit-exact parity at negligible cost (a couple of instructions per coord).
 
 ---
 
@@ -297,10 +346,14 @@ Setup: CUDA 12.8 toolchain + PyTorch 2.10.0+cu128 installed (nvcc on PATH). No b
 
 ```bash
 # Quick correctness smoke test (~10 s incl. first JIT compile)
+# Also verifies fused vs unfused bit-exact equivalence
 python3 benchmark/smoke_test.py
 
 # Synthetic microbenchmark (~2–3 min) — produces the Part I results
 python3 benchmark/run_benchmark.py
+
+# Fused vs unfused MSE kernel benchmark (~90 s)
+python3 benchmark/fused_benchmark.py
 
 # SIFT-1M end-to-end retrieval (~7 min, auto-downloads SIFT-1M on first run)
 python3 benchmark/sift_retrieval.py
@@ -313,6 +366,7 @@ Outputs:
 | Env probe | `results/env.json`, `results/sift/env.json` |
 | Synthetic metrics | `results/summary.csv`, `results/raw/*.json`, `results/fig1..fig10*.png` |
 | SIFT metrics | `results/sift/summary.csv`, `results/sift/raw/retrieval.json`, `results/sift/fig_sift_*.png` |
+| Fusion metrics | `results/fusion/summary.csv`, `results/fusion/raw/fusion.json`, `results/fusion/fig_fusion_speedup.png` |
 
 The SIFT download (~160 MB tar.gz over FTP) is cached in `.cache/sift1m/`. Ground truth is computed once and cached as `.cache/sift1m/gt_ip_top100.pt`. Re-running is fast.
 

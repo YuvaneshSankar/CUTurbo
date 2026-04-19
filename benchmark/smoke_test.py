@@ -73,6 +73,31 @@ def check_mse(d=128, N=256, b=2, seed=3):
     assert lower * 0.5 < mse < upper * 2.0, "MSE out of expected theoretical band"
 
 
+def check_fused_equivalence(d=128, N=256, b=2, seed=3):
+    """Fused kernel must produce bit-exact packed indices and identical x_hat
+    as the unfused two-kernel path (same FWHT, same rounding, same packing)."""
+    torch.manual_seed(seed)
+    x = torch.randn(N, d, device="cuda", dtype=torch.float32)
+    x = x / x.norm(dim=1, keepdim=True)
+
+    unfused = TurboQuantMSE(d, b, "cuda", seed=11, fused=False)
+    fused   = TurboQuantMSE(d, b, "cuda", seed=11, fused=True)
+    # Parameters must match — same seed → same signs and codebook
+    assert torch.equal(unfused.signs, fused.signs)
+    assert torch.equal(unfused.codebook, fused.codebook)
+
+    code_unf = unfused.quantize(x)
+    code_fus = fused.quantize(x)
+    assert torch.equal(code_unf.packed, code_fus.packed), \
+        f"fused quantize packed indices differ at b={b}"
+
+    xh_unf = unfused.dequantize(code_unf)
+    xh_fus = fused.dequantize(code_fus)
+    max_err = (xh_unf - xh_fus).abs().max().item()
+    print(f"fused vs unfused  b={b}: packed bit-exact ✓  dequant max abs err = {max_err:.2e}")
+    assert max_err < 1e-5, f"fused dequant mismatch at b={b}: {max_err}"
+
+
 def check_prod(d=128, N=256, b=2, seed=3):
     torch.manual_seed(seed)
     x = torch.randn(N, d, device="cuda", dtype=torch.float32)
@@ -101,6 +126,10 @@ if __name__ == "__main__":
     print("=== TurboQuant_mse correctness + bound check ===")
     for b in (1, 2, 4):
         check_mse(b=b)
+    print()
+    print("=== Fused vs unfused kernel equivalence ===")
+    for b in (1, 2, 4):
+        check_fused_equivalence(b=b)
     print()
     print("=== TurboQuant_prod unbiasedness ===")
     for b in (2, 3, 4):

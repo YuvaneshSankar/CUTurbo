@@ -370,6 +370,51 @@ def plot_seed_stability(by_bit: Dict[int, Dict[str, List[float]]], path: str):
 
 
 # ---------------------------------------------------------------------------
+# Kernel fusion (fused vs unfused MSE quantize/dequantize)
+# ---------------------------------------------------------------------------
+
+def plot_fusion_speedup(rows: List[Dict], path: str,
+                        title: str = "Kernel fusion: unfused vs fused TurboQuant_mse latency"):
+    """rows: each dict has {config, direction, unfused_us, fused_us, speedup}."""
+    # Stable ordering of configs as they appear in the input
+    seen = []
+    for r in rows:
+        if r["config"] not in seen:
+            seen.append(r["config"])
+    # Two directions: quantize and dequantize. Build one subplot per direction.
+    directions = ["quantize", "dequantize"]
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.6), sharey=False)
+
+    for ax, direction in zip(axes, directions):
+        keep = [r for r in rows if r["direction"] == direction]
+        configs = [c for c in seen if any(r["config"] == c for r in keep)]
+        x = np.arange(len(configs))
+        width = 0.38
+        unfused_vals = [next(r["unfused_us"] for r in keep if r["config"] == c) for c in configs]
+        fused_vals   = [next(r["fused_us"]   for r in keep if r["config"] == c) for c in configs]
+        speedups     = [next(r["speedup"]    for r in keep if r["config"] == c) for c in configs]
+
+        ax.bar(x - width / 2, unfused_vals, width, color=PAL["naive"],
+               edgecolor="black", linewidth=0.5, label="unfused (two kernels)")
+        ax.bar(x + width / 2, fused_vals, width, color=PAL["mse"],
+               edgecolor="black", linewidth=0.5, label="fused (one kernel)")
+
+        for xi, uv, fv, sp in zip(x, unfused_vals, fused_vals, speedups):
+            y = max(uv, fv) * 1.04
+            ax.text(xi, y, f"{sp:.2f}×", ha="center", fontsize=9, fontweight="bold")
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(configs, rotation=30, ha="right", fontsize=8)
+        ax.set_ylabel("Median latency (µs)")
+        ax.set_title(f"{direction}")
+        ax.legend(loc="upper left", fontsize=9)
+
+    fig.suptitle(title, fontsize=12)
+    plt.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
 # Retrieval figures (SIFT-1M)
 # ---------------------------------------------------------------------------
 

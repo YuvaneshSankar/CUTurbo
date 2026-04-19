@@ -160,6 +160,152 @@ __global__ void unpack_dequantize_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Fused FWHT + quantize-pack (MSE forward path, single kernel)
+// ---------------------------------------------------------------------------
+//
+// Combines `fwht_kernel<SIGNS_FIRST=true>` and `quantize_pack_kernel<B>` into
+// one block per vector. Saves one kernel launch and the HBM round-trip of
+// the intermediate `y` tensor (N·d·4 bytes written then read).
+//
+// Shared memory layout: d floats (FWHT working buffer) followed by
+// d uint8 indices (pre-pack scratch). Total 5·d bytes — well under
+// 48 KB for d ≤ 512 on sm_86.
+
+template <int B>
+__global__ void fused_quantize_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ signs,
+    const float* __restrict__ codebook,
+    uint32_t* __restrict__ packed,
+    int d,
+    float scale)
+{
+    constexpr int K = 1 << B;
+    constexpr int IDX_PER_WORD = 32 / B;
+    constexpr uint32_t MASK = (1u << B) - 1u;
+
+    extern __shared__ float smem[];
+    uint8_t* sidx = reinterpret_cast<uint8_t*>(smem + d);
+
+    int tid = threadIdx.x;
+    int n   = blockIdx.x;
+
+    // Load x with sign flip
+    for (int c = tid; c < d; c += blockDim.x) {
+        smem[c] = x[n * d + c] * signs[c];
+    }
+    __syncthreads();
+
+    // In-place FWHT butterflies
+    for (int h = 1; h < d; h <<= 1) {
+        int pairs = d >> 1;
+        for (int p = tid; p < pairs; p += blockDim.x) {
+            int i = ((p / h) << 1) * h + (p % h);
+            int j = i + h;
+            float a = smem[i];
+            float b = smem[j];
+            smem[i] = a + b;
+            smem[j] = a - b;
+        }
+        __syncthreads();
+    }
+
+    // Scale + nearest-centroid, write indices to byte scratch.
+    // __fmul_rn prevents --use_fast_math from fusing the scale multiply with
+    // the downstream (v - codebook[k]) subtraction into an FMA — that fusion
+    // would change rounding at tie-break boundaries and break bit-exact
+    // equivalence with the unfused two-kernel path (which force-rounds through
+    // HBM between kernels).
+    for (int c = tid; c < d; c += blockDim.x) {
+        float v = __fmul_rn(smem[c], scale);
+        float best_dist = 1e30f;
+        int   best_idx  = 0;
+        #pragma unroll
+        for (int k = 0; k < K; ++k) {
+            float diff = v - codebook[k];
+            float dist = diff * diff;
+            if (dist < best_dist) { best_dist = dist; best_idx = k; }
+        }
+        sidx[c] = static_cast<uint8_t>(best_idx);
+    }
+    __syncthreads();
+
+    // Pack IDX_PER_WORD indices per uint32
+    int words_per_row = (d + IDX_PER_WORD - 1) / IDX_PER_WORD;
+    for (int w = tid; w < words_per_row; w += blockDim.x) {
+        uint32_t word = 0;
+        int base = w * IDX_PER_WORD;
+        #pragma unroll
+        for (int i = 0; i < IDX_PER_WORD; ++i) {
+            int c = base + i;
+            if (c < d) {
+                word |= (static_cast<uint32_t>(sidx[c]) & MASK) << (i * B);
+            }
+        }
+        packed[n * words_per_row + w] = word;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fused unpack-dequantize + inverse FWHT (MSE reverse path, single kernel)
+// ---------------------------------------------------------------------------
+//
+// Combines `unpack_dequantize_kernel<B>` and `fwht_kernel<SIGNS_FIRST=false>`.
+// Shared memory: d floats.
+
+template <int B>
+__global__ void fused_dequantize_kernel(
+    const uint32_t* __restrict__ packed,
+    const float* __restrict__ signs,
+    const float* __restrict__ codebook,
+    float* __restrict__ y,
+    int d,
+    float scale)
+{
+    constexpr int IDX_PER_WORD = 32 / B;
+    constexpr uint32_t MASK = (1u << B) - 1u;
+
+    extern __shared__ float smem[];
+
+    int tid = threadIdx.x;
+    int n   = blockIdx.x;
+    int words_per_row = (d + IDX_PER_WORD - 1) / IDX_PER_WORD;
+
+    // Unpack + codebook lookup into shared memory
+    for (int c = tid; c < d; c += blockDim.x) {
+        int w = c / IDX_PER_WORD;
+        int i = c - w * IDX_PER_WORD;
+        uint32_t word = packed[n * words_per_row + w];
+        int idx = (word >> (i * B)) & MASK;
+        smem[c] = codebook[idx];
+    }
+    __syncthreads();
+
+    // In-place FWHT butterflies (inverse uses the same butterflies; scaling
+    // and sign flip happen on the way out)
+    for (int h = 1; h < d; h <<= 1) {
+        int pairs = d >> 1;
+        for (int p = tid; p < pairs; p += blockDim.x) {
+            int i = ((p / h) << 1) * h + (p % h);
+            int j = i + h;
+            float a = smem[i];
+            float b = smem[j];
+            smem[i] = a + b;
+            smem[j] = a - b;
+        }
+        __syncthreads();
+    }
+
+    // Scale + sign flip, write to HBM.
+    // Use __fmul_rn to force full fp32 rounding at each multiplication,
+    // matching the unfused path's HBM round-trip semantics exactly.
+    for (int c = tid; c < d; c += blockDim.x) {
+        float scaled = __fmul_rn(smem[c], scale);
+        y[n * d + c]  = __fmul_rn(scaled, signs[c]);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // QJL 1-bit sign packing / unpacking
 // ---------------------------------------------------------------------------
 
@@ -335,6 +481,92 @@ torch::Tensor unpack_dequantize(torch::Tensor packed, torch::Tensor codebook,
     return y;
 }
 
+torch::Tensor fused_quantize(torch::Tensor x, torch::Tensor signs,
+                              torch::Tensor codebook, int64_t B) {
+    check_cuda_tensor(x, "x");
+    check_cuda_tensor(signs, "signs");
+    check_cuda_tensor(codebook, "codebook");
+    TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be float32");
+    TORCH_CHECK(signs.dtype() == torch::kFloat32, "signs must be float32");
+    TORCH_CHECK(codebook.dtype() == torch::kFloat32, "codebook must be float32");
+    TORCH_CHECK(x.dim() == 2, "x must be (N, d)");
+    TORCH_CHECK(B == 1 || B == 2 || B == 4, "B must be 1, 2, or 4");
+    TORCH_CHECK(codebook.numel() == (1LL << B), "codebook size must be 2^B");
+
+    int N = x.size(0);
+    int d = x.size(1);
+    TORCH_CHECK((d & (d - 1)) == 0 && d >= 2, "d must be a power of 2, got ", d);
+    TORCH_CHECK(signs.numel() == d, "signs must have length d");
+
+    int idx_per_word = 32 / (int)B;
+    int words_per_row = (d + idx_per_word - 1) / idx_per_word;
+    auto opts = torch::TensorOptions().dtype(torch::kInt32).device(x.device());
+    auto packed = torch::empty({N, words_per_row}, opts);
+
+    float scale = 1.0f / std::sqrt((float)d);
+    int block = pick_block_size(d);
+    size_t shmem = d * sizeof(float) + d * sizeof(uint8_t);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    if (B == 1) {
+        fused_quantize_kernel<1><<<N, block, shmem, stream>>>(
+            x.data_ptr<float>(), signs.data_ptr<float>(), codebook.data_ptr<float>(),
+            reinterpret_cast<uint32_t*>(packed.data_ptr<int32_t>()), d, scale);
+    } else if (B == 2) {
+        fused_quantize_kernel<2><<<N, block, shmem, stream>>>(
+            x.data_ptr<float>(), signs.data_ptr<float>(), codebook.data_ptr<float>(),
+            reinterpret_cast<uint32_t*>(packed.data_ptr<int32_t>()), d, scale);
+    } else {
+        fused_quantize_kernel<4><<<N, block, shmem, stream>>>(
+            x.data_ptr<float>(), signs.data_ptr<float>(), codebook.data_ptr<float>(),
+            reinterpret_cast<uint32_t*>(packed.data_ptr<int32_t>()), d, scale);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return packed;
+}
+
+torch::Tensor fused_dequantize(torch::Tensor packed, torch::Tensor signs,
+                                torch::Tensor codebook, int64_t B, int64_t d) {
+    check_cuda_tensor(packed, "packed");
+    check_cuda_tensor(signs, "signs");
+    check_cuda_tensor(codebook, "codebook");
+    TORCH_CHECK(packed.dim() == 2);
+    TORCH_CHECK(signs.dtype() == torch::kFloat32);
+    TORCH_CHECK(codebook.dtype() == torch::kFloat32);
+    TORCH_CHECK(B == 1 || B == 2 || B == 4);
+    TORCH_CHECK(codebook.numel() == (1LL << B));
+    TORCH_CHECK((d & (d - 1)) == 0 && d >= 2);
+    TORCH_CHECK(signs.numel() == d);
+
+    int N = packed.size(0);
+    auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(packed.device());
+    auto y = torch::empty({N, (int64_t)d}, opts);
+
+    float scale = 1.0f / std::sqrt((float)d);
+    int block = pick_block_size((int)d);
+    size_t shmem = (size_t)d * sizeof(float);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    if (B == 1) {
+        fused_dequantize_kernel<1><<<N, block, shmem, stream>>>(
+            reinterpret_cast<uint32_t*>(packed.data_ptr<int32_t>()),
+            signs.data_ptr<float>(), codebook.data_ptr<float>(),
+            y.data_ptr<float>(), (int)d, scale);
+    } else if (B == 2) {
+        fused_dequantize_kernel<2><<<N, block, shmem, stream>>>(
+            reinterpret_cast<uint32_t*>(packed.data_ptr<int32_t>()),
+            signs.data_ptr<float>(), codebook.data_ptr<float>(),
+            y.data_ptr<float>(), (int)d, scale);
+    } else {
+        fused_dequantize_kernel<4><<<N, block, shmem, stream>>>(
+            reinterpret_cast<uint32_t*>(packed.data_ptr<int32_t>()),
+            signs.data_ptr<float>(), codebook.data_ptr<float>(),
+            y.data_ptr<float>(), (int)d, scale);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return y;
+}
+
 torch::Tensor pack_signs(torch::Tensor x) {
     check_cuda_tensor(x, "x");
     TORCH_CHECK(x.dtype() == torch::kFloat32);
@@ -377,6 +609,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fwht_inverse",      &fwht_inverse,      "FWHT inverse rotation (butterflies then signs)");
     m.def("quantize_pack",     &quantize_pack,     "Per-coord quantize + bit-pack");
     m.def("unpack_dequantize", &unpack_dequantize, "Bit-unpack + codebook lookup");
+    m.def("fused_quantize",    &fused_quantize,    "Fused fwht_forward + quantize_pack (one kernel)");
+    m.def("fused_dequantize",  &fused_dequantize,  "Fused unpack_dequantize + fwht_inverse (one kernel)");
     m.def("pack_signs",        &pack_signs,        "Pack sign bits to uint32 words");
     m.def("unpack_signs",      &unpack_signs,      "Unpack sign bits to ±1 floats");
 }

@@ -44,7 +44,7 @@ class MSECode:
 
 
 class TurboQuantMSE:
-    def __init__(self, d: int, b: int, device, seed: int = 0):
+    def __init__(self, d: int, b: int, device, seed: int = 0, fused: bool = True):
         assert b in (1, 2, 4), "packed kernels require b ∈ {1, 2, 4}"
         assert d & (d - 1) == 0 and d >= 2, "d must be a power of 2"
         self.d = d
@@ -53,15 +53,23 @@ class TurboQuantMSE:
         self.ext = get_ext()
         self.signs = _make_signs(d, self.device, seed)
         self.codebook = build_codebook(b, d, self.device)
+        self.fused = fused
 
     def quantize(self, x: torch.Tensor) -> MSECode:
         assert x.dim() == 2 and x.shape[1] == self.d
         x = x.to(device=self.device, dtype=torch.float32).contiguous()
-        y = self.ext.fwht_forward(x, self.signs)
-        packed = self.ext.quantize_pack(y, self.codebook, int(self.b))
+        if self.fused:
+            packed = self.ext.fused_quantize(x, self.signs, self.codebook, int(self.b))
+        else:
+            y = self.ext.fwht_forward(x, self.signs)
+            packed = self.ext.quantize_pack(y, self.codebook, int(self.b))
         return MSECode(packed=packed)
 
     def dequantize(self, code: MSECode) -> torch.Tensor:
+        if self.fused:
+            return self.ext.fused_dequantize(
+                code.packed, self.signs, self.codebook, int(self.b), int(self.d)
+            )
         y_hat = self.ext.unpack_dequantize(
             code.packed, self.codebook, int(self.b), int(self.d)
         )
@@ -86,14 +94,14 @@ class ProdCode:
 
 
 class TurboQuantProd:
-    def __init__(self, d: int, b: int, device, seed: int = 0):
+    def __init__(self, d: int, b: int, device, seed: int = 0, fused: bool = True):
         assert b >= 2, "prod variant needs at least 2 total bits (b-1 for MSE stage, 1 for QJL)"
         assert (b - 1) in (1, 2, 4), "b-1 must be in {1, 2, 4} for packed MSE kernel"
         self.d = d
         self.b = b
         self.device = torch.device(device)
         self.ext = get_ext()
-        self.mse = TurboQuantMSE(d, b - 1, device, seed=seed)
+        self.mse = TurboQuantMSE(d, b - 1, device, seed=seed, fused=fused)
         self.S = _make_qjl_matrix(d, self.device, seed=seed + 97)
 
     def quantize(self, x: torch.Tensor) -> ProdCode:
