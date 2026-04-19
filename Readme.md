@@ -47,8 +47,7 @@ Terminology confusion is easy here because the word "baseline" is overloaded. In
 | `fp16` | Type cast, no quantization | Memory-only baseline (2× compression, near-perfect quality) | No — included so readers can separate dtype savings from quantization savings |
 | `naive uniform scalar` (per-coord bucketing, 1 B/coord at b=8, packed similarly at b=2/4) | An alternative quantizer with the same bit budget as TurboQuant | **The apples-to-apples competitor** — what you'd build if you didn't know TurboQuant | Yes — and TurboQuant wins on every metric at every bit width |
 
-Two further clarifications that cost the first draft of this Readme some confusion:
-
+Two further clarifications :
 - **The paper's end-to-end inference speedup (§4.2–4.3) is not reproduced here.** That claim requires loading Llama-3.1-8B and measuring attention wall-clock; 8 B parameters won't fit on 4 GB VRAM. What we *do* reproduce is the mechanism that drives that speedup: smaller KV cache at the same retrieval accuracy. The SIFT-1M results verify this on a public, publishable benchmark.
 - **Kernel-time latency (microseconds to compress a batch of vectors) vs end-to-end retrieval throughput (queries per second on a 1 M corpus) measure different things.** The kernel-time table is how fast one `quantize()` call is; the retrieval table is how fast you can serve real ANN queries. Don't conflate them.
 
