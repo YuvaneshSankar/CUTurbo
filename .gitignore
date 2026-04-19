@@ -1,0 +1,10 @@
+.claude
+.build/
+__pycache__/
+*.pyc
+*.pyo
+*.so
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+.DS_Store

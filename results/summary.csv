@@ -1,0 +1,114 @@
+group,key,value
+accuracy_mse,b=1_mean,0.360912
+accuracy_mse,b=1_std,0.000142
+accuracy_mse,b=1_upper,0.680175
+accuracy_mse,b=1_lower,0.250000
+accuracy_mse,b=2_mean,0.116008
+accuracy_mse,b=2_std,0.000084
+accuracy_mse,b=2_upper,0.170044
+accuracy_mse,b=2_lower,0.062500
+accuracy_mse,b=4_mean,0.009327
+accuracy_mse,b=4_std,0.000009
+accuracy_mse,b=4_upper,0.010628
+accuracy_mse,b=4_lower,0.003906
+accuracy_prod,b=2_mean,0.004392
+accuracy_prod,b=2_std,0.000090
+accuracy_prod,b=2_upper,0.008347
+accuracy_prod,b=2_lower,0.000488
+accuracy_prod,b=3_mean,0.001409
+accuracy_prod,b=3_std,0.000027
+accuracy_prod,b=3_upper,0.002087
+accuracy_prod,b=3_lower,0.000122
+accuracy_prod,b=5_mean,0.000113
+accuracy_prod,b=5_std,0.000002
+accuracy_prod,b=5_upper,0.000130
+accuracy_prod,b=5_lower,0.000008
+bias,mse_ip=0.01,-0.001205
+bias,mse_ip=0.1,-0.011682
+bias,mse_ip=0.3,-0.034425
+bias,mse_ip=0.5,-0.057475
+bias,prod_ip=0.01,+0.000084
+bias,prod_ip=0.1,-0.000033
+bias,prod_ip=0.3,+0.000279
+bias,prod_ip=0.5,+0.000746
+latency/fp16 cast/d=128/N=65536,quantize_median_us,275.4560
+latency/fp16 cast/d=128/N=65536,dequantize_median_us,307.2000
+latency/fp16 cast/d=128/N=65536,quantize_throughput_gbps,121.81
+latency/naive scalar b=2/d=128/N=65536,quantize_median_us,1721.3440
+latency/naive scalar b=2/d=128/N=65536,dequantize_median_us,975.8720
+latency/naive scalar b=2/d=128/N=65536,quantize_throughput_gbps,19.49
+latency/TurboQuant_mse b=2/d=128/N=65536,quantize_median_us,1155.0720
+latency/TurboQuant_mse b=2/d=128/N=65536,dequantize_median_us,1104.8959
+latency/TurboQuant_mse b=2/d=128/N=65536,quantize_throughput_gbps,29.05
+latency/TurboQuant_prod b=2/d=128/N=65536,quantize_median_us,4174.3360
+latency/TurboQuant_prod b=2/d=128/N=65536,dequantize_median_us,2872.3199
+latency/TurboQuant_prod b=2/d=128/N=65536,quantize_throughput_gbps,8.04
+latency/fp16 cast/d=128/N=262144,quantize_median_us,1092.6080
+latency/fp16 cast/d=128/N=262144,dequantize_median_us,1225.7280
+latency/fp16 cast/d=128/N=262144,quantize_throughput_gbps,122.84
+latency/naive scalar b=2/d=128/N=262144,quantize_median_us,6850.5602
+latency/naive scalar b=2/d=128/N=262144,dequantize_median_us,3880.9600
+latency/naive scalar b=2/d=128/N=262144,quantize_throughput_gbps,19.59
+latency/TurboQuant_mse b=2/d=128/N=262144,quantize_median_us,4723.7120
+latency/TurboQuant_mse b=2/d=128/N=262144,dequantize_median_us,4426.7521
+latency/TurboQuant_mse b=2/d=128/N=262144,quantize_throughput_gbps,28.41
+latency/TurboQuant_prod b=2/d=128/N=262144,quantize_median_us,16525.3124
+latency/TurboQuant_prod b=2/d=128/N=262144,dequantize_median_us,11588.0957
+latency/TurboQuant_prod b=2/d=128/N=262144,quantize_throughput_gbps,8.12
+latency/fp16 cast/d=128/N=1048576,quantize_median_us,4358.1438
+latency/fp16 cast/d=128/N=1048576,dequantize_median_us,4913.2962
+latency/fp16 cast/d=128/N=1048576,quantize_throughput_gbps,123.19
+latency/naive scalar b=2/d=128/N=1048576,quantize_median_us,27406.4322
+latency/naive scalar b=2/d=128/N=1048576,dequantize_median_us,15504.3840
+latency/naive scalar b=2/d=128/N=1048576,quantize_throughput_gbps,19.59
+latency/TurboQuant_mse b=2/d=128/N=1048576,quantize_median_us,19741.1842
+latency/TurboQuant_mse b=2/d=128/N=1048576,dequantize_median_us,19271.6799
+latency/TurboQuant_mse b=2/d=128/N=1048576,quantize_throughput_gbps,27.20
+latency/fp16 cast/d=64/N=131072,quantize_median_us,299.0080
+latency/fp16 cast/d=64/N=131072,dequantize_median_us,308.2240
+latency/fp16 cast/d=64/N=131072,quantize_throughput_gbps,112.22
+latency/naive scalar b=2/d=64/N=131072,quantize_median_us,1724.4160
+latency/naive scalar b=2/d=64/N=131072,dequantize_median_us,975.8720
+latency/naive scalar b=2/d=64/N=131072,quantize_throughput_gbps,19.46
+latency/TurboQuant_mse b=2/d=64/N=131072,quantize_median_us,1598.4640
+latency/TurboQuant_mse b=2/d=64/N=131072,dequantize_median_us,1541.1201
+latency/TurboQuant_mse b=2/d=64/N=131072,quantize_throughput_gbps,20.99
+latency/TurboQuant_prod b=2/d=64/N=131072,quantize_median_us,5796.8640
+latency/TurboQuant_prod b=2/d=64/N=131072,dequantize_median_us,3304.4479
+latency/TurboQuant_prod b=2/d=64/N=131072,quantize_throughput_gbps,5.79
+latency/fp16 cast/d=128/N=131072,quantize_median_us,547.8400
+latency/fp16 cast/d=128/N=131072,dequantize_median_us,618.4960
+latency/fp16 cast/d=128/N=131072,quantize_throughput_gbps,122.50
+latency/naive scalar b=2/d=128/N=131072,quantize_median_us,3447.8080
+latency/naive scalar b=2/d=128/N=131072,dequantize_median_us,1945.1360
+latency/naive scalar b=2/d=128/N=131072,quantize_throughput_gbps,19.46
+latency/TurboQuant_mse b=2/d=128/N=131072,quantize_median_us,2649.0879
+latency/TurboQuant_mse b=2/d=128/N=131072,dequantize_median_us,2373.6320
+latency/TurboQuant_mse b=2/d=128/N=131072,quantize_throughput_gbps,25.33
+latency/TurboQuant_prod b=2/d=128/N=131072,quantize_median_us,9085.9518
+latency/TurboQuant_prod b=2/d=128/N=131072,dequantize_median_us,6234.1118
+latency/TurboQuant_prod b=2/d=128/N=131072,quantize_throughput_gbps,7.39
+latency/fp16 cast/d=256/N=131072,quantize_median_us,1092.6080
+latency/fp16 cast/d=256/N=131072,dequantize_median_us,1229.8239
+latency/fp16 cast/d=256/N=131072,quantize_throughput_gbps,122.84
+latency/naive scalar b=2/d=256/N=131072,quantize_median_us,6897.6641
+latency/naive scalar b=2/d=256/N=131072,dequantize_median_us,3881.9840
+latency/naive scalar b=2/d=256/N=131072,quantize_throughput_gbps,19.46
+latency/TurboQuant_mse b=2/d=256/N=131072,quantize_median_us,5852.1600
+latency/TurboQuant_mse b=2/d=256/N=131072,dequantize_median_us,5599.7441
+latency/TurboQuant_mse b=2/d=256/N=131072,quantize_throughput_gbps,22.93
+latency/TurboQuant_prod b=2/d=256/N=131072,quantize_median_us,22604.2881
+latency/TurboQuant_prod b=2/d=256/N=131072,dequantize_median_us,16050.6887
+latency/TurboQuant_prod b=2/d=256/N=131072,quantize_throughput_gbps,5.94
+latency/fp16 cast/d=512/N=131072,quantize_median_us,2181.1199
+latency/fp16 cast/d=512/N=131072,dequantize_median_us,2497.5359
+latency/fp16 cast/d=512/N=131072,quantize_throughput_gbps,123.07
+latency/naive scalar b=2/d=512/N=131072,quantize_median_us,13827.5843
+latency/naive scalar b=2/d=512/N=131072,dequantize_median_us,7759.8720
+latency/naive scalar b=2/d=512/N=131072,quantize_throughput_gbps,19.41
+latency/TurboQuant_mse b=2/d=512/N=131072,quantize_median_us,10765.3122
+latency/TurboQuant_mse b=2/d=512/N=131072,dequantize_median_us,10632.1917
+latency/TurboQuant_mse b=2/d=512/N=131072,quantize_throughput_gbps,24.94
+latency/TurboQuant_prod b=2/d=512/N=131072,quantize_median_us,54533.1192
+latency/TurboQuant_prod b=2/d=512/N=131072,dequantize_median_us,46063.1046
+latency/TurboQuant_prod b=2/d=512/N=131072,quantize_throughput_gbps,4.92
