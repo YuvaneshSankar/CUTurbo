@@ -1,10 +1,42 @@
-.claude
-.build/
-__pycache__/
-*.pyc
-*.pyo
-*.so
-*.egg-info/
-.pytest_cache/
-.ipynb_checkpoints/
+# Claude Code
+.claude/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Python byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python packaging & environments
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Python test / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# CUDA / native build artefacts
+.build/
+*.so
+*.o
+*.obj
+
+# Dataset caches (downloaded on demand)
+.cache/

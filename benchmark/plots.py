@@ -370,6 +370,111 @@ def plot_seed_stability(by_bit: Dict[int, Dict[str, List[float]]], path: str):
 
 
 # ---------------------------------------------------------------------------
+# Retrieval figures (SIFT-1M)
+# ---------------------------------------------------------------------------
+
+def plot_recall_vs_size(rows: List[Dict], path: str,
+                        title: str = "SIFT-1M: Recall@10 vs index size (Pareto)"):
+    """rows: each dict has keys {method, recall_at_10, index_mb}."""
+    fig, ax = plt.subplots(figsize=(7.2, 4.4))
+    for r in rows:
+        ax.scatter(r["index_mb"], r["recall_at_10"],
+                   s=72, color=_method_color(r["method"]),
+                   edgecolor="black", linewidth=0.4, zorder=3)
+        ax.annotate(r["method"],
+                    xy=(r["index_mb"], r["recall_at_10"]),
+                    xytext=(6, 4), textcoords="offset points",
+                    fontsize=8)
+    ax.set_xscale("log")
+    ax.set_xlabel("Index size (MB)")
+    ax.set_ylabel("Recall@10")
+    ax.set_ylim(-0.02, 1.04)
+    ax.set_title(title)
+    plt.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_recall_vs_qps(rows: List[Dict], path: str,
+                       title: str = "SIFT-1M: Recall@10 vs query throughput"):
+    fig, ax = plt.subplots(figsize=(7.2, 4.4))
+    for r in rows:
+        ax.scatter(r["qps"], r["recall_at_10"],
+                   s=72, color=_method_color(r["method"]),
+                   edgecolor="black", linewidth=0.4, zorder=3)
+        ax.annotate(r["method"],
+                    xy=(r["qps"], r["recall_at_10"]),
+                    xytext=(6, 4), textcoords="offset points",
+                    fontsize=8)
+    ax.set_xscale("log")
+    ax.set_xlabel("Queries per second (higher is better)")
+    ax.set_ylabel("Recall@10")
+    ax.set_ylim(-0.02, 1.04)
+    ax.set_title(title)
+    plt.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_recall_rerank_vs_size(rows: List[Dict], path: str,
+                                title: str = "SIFT-1M: two-stage Recall@10 (fp32 rerank) vs index size"):
+    """Same Pareto as plot_recall_vs_size but using the production-deployment metric:
+    quantized index produces top-100 candidates → fp32 re-ranks them → Recall@10."""
+    fig, ax = plt.subplots(figsize=(7.2, 4.4))
+    for r in rows:
+        y = r.get("recall_at_10_rerank", r.get("recall_at_10"))
+        ax.scatter(r["index_mb"], y,
+                   s=72, color=_method_color(r["method"]),
+                   edgecolor="black", linewidth=0.4, zorder=3)
+        ax.annotate(r["method"],
+                    xy=(r["index_mb"], y),
+                    xytext=(6, 4), textcoords="offset points",
+                    fontsize=8)
+    ax.set_xscale("log")
+    ax.set_xlabel("Index size (MB)")
+    ax.set_ylabel("Recall@10 (2-stage: quantized shortlist + fp32 rerank)")
+    ax.set_ylim(-0.02, 1.04)
+    ax.set_title(title)
+    plt.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_prod_vs_mse_recall(rows: List[Dict], path: str,
+                            title: str = "SIFT-1M: TurboQuant_mse vs TurboQuant_prod at matched bits"):
+    """rows: each dict has {variant ∈ {mse, prod}, b, recall_at_10}. The prod variant at bit b
+    uses b-1 bits for the MSE stage plus a 1-bit QJL residual — this is the paper's fair
+    comparison: same total bit budget, unbiased vs biased."""
+    mse_rows = sorted([r for r in rows if r["variant"] == "mse"], key=lambda r: r["b"])
+    prod_rows = sorted([r for r in rows if r["variant"] == "prod"], key=lambda r: r["b"])
+    bits = sorted({r["b"] for r in rows})
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.4))
+    width = 0.38
+    x = np.arange(len(bits))
+
+    def _bar(variant_rows, offset, color, label):
+        values = []
+        for b in bits:
+            match = [r for r in variant_rows if r["b"] == b]
+            values.append(match[0]["recall_at_10"] if match else np.nan)
+        ax.bar(x + offset, values, width, color=color, edgecolor="black",
+               linewidth=0.5, label=label)
+        for xi, v in zip(x + offset, values):
+            if not np.isnan(v):
+                ax.text(xi, v + 0.01, f"{v:.3f}", ha="center", fontsize=8)
+
+    _bar(mse_rows, -width / 2, PAL["mse"], "TurboQuant_mse (biased)")
+    _bar(prod_rows, +width / 2, PAL["prod"], "TurboQuant_prod (unbiased)")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"b={b}" for b in bits])
+    ax.set_ylabel("Recall@10")
+    ax.set_ylim(0, 1.08)
+    ax.set_title(title)
+    ax.legend(loc="lower right", fontsize=9)
+    plt.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
 
