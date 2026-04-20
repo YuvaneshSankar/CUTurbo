@@ -373,6 +373,102 @@ def plot_seed_stability(by_bit: Dict[int, Dict[str, List[float]]], path: str):
 # Kernel fusion (fused vs unfused MSE quantize/dequantize)
 # ---------------------------------------------------------------------------
 
+def plot_fusion_speedup_3col(rows: List[Dict], path: str,
+                              title: str = "TurboQuant_mse kernel: unfused vs fused vs fused+PTX"):
+    """rows have {config, direction, unfused_us, fused_us, fused_ptx_us (or None),
+    speedup_fused, speedup_ptx (or None)}. Two subplots: quantize (3 bars) and
+    dequantize (2 bars; PTX variant not applicable)."""
+    seen = []
+    for r in rows:
+        if r["config"] not in seen:
+            seen.append(r["config"])
+    fig, axes = plt.subplots(1, 2, figsize=(13.5, 4.8), sharey=False)
+
+    # --- Quantize: 3 bars per config ---
+    ax = axes[0]
+    keep = [r for r in rows if r["direction"] == "quantize"]
+    configs = [c for c in seen if any(r["config"] == c for r in keep)]
+    x = np.arange(len(configs))
+    width = 0.27
+    unf = [next(r["unfused_us"]   for r in keep if r["config"] == c) for c in configs]
+    fus = [next(r["fused_us"]     for r in keep if r["config"] == c) for c in configs]
+    ptx = [next(r["fused_ptx_us"] for r in keep if r["config"] == c) for c in configs]
+    sp_fus = [next(r["speedup_fused"] for r in keep if r["config"] == c) for c in configs]
+    sp_ptx = [next(r["speedup_ptx"]   for r in keep if r["config"] == c) for c in configs]
+
+    ax.bar(x - width, unf, width, color=PAL["naive"], edgecolor="black",
+           linewidth=0.5, label="unfused")
+    ax.bar(x,         fus, width, color=PAL["mse"],   edgecolor="black",
+           linewidth=0.5, label="fused (CUDA C++)")
+    ax.bar(x + width, ptx, width, color=PAL["prod"],  edgecolor="black",
+           linewidth=0.5, label="fused + PTX bfi")
+
+    for xi, u, f, p, sf, sp in zip(x, unf, fus, ptx, sp_fus, sp_ptx):
+        y = max(u, f, p) * 1.04
+        ax.text(xi - width, u, f"{sf:.2f}×", ha="center", va="bottom", fontsize=7, rotation=0)
+        ax.text(xi + width, p, f"{sp:.2f}×", ha="center", va="bottom", fontsize=7,
+                fontweight="bold")
+    ax.set_xticks(x); ax.set_xticklabels(configs, rotation=30, ha="right", fontsize=8)
+    ax.set_ylabel("Median latency (µs)")
+    ax.set_title("quantize")
+    ax.legend(loc="upper left", fontsize=9)
+
+    # --- Dequantize: 2 bars per config (no PTX dequant variant) ---
+    ax = axes[1]
+    keep = [r for r in rows if r["direction"] == "dequantize"]
+    configs = [c for c in seen if any(r["config"] == c for r in keep)]
+    x = np.arange(len(configs))
+    width = 0.38
+    unf = [next(r["unfused_us"] for r in keep if r["config"] == c) for c in configs]
+    fus = [next(r["fused_us"]   for r in keep if r["config"] == c) for c in configs]
+    sp_fus = [next(r["speedup_fused"] for r in keep if r["config"] == c) for c in configs]
+
+    ax.bar(x - width / 2, unf, width, color=PAL["naive"], edgecolor="black",
+           linewidth=0.5, label="unfused")
+    ax.bar(x + width / 2, fus, width, color=PAL["mse"],   edgecolor="black",
+           linewidth=0.5, label="fused (CUDA C++)")
+    for xi, u, f, sp in zip(x, unf, fus, sp_fus):
+        y = max(u, f) * 1.04
+        ax.text(xi, y, f"{sp:.2f}×", ha="center", fontsize=9, fontweight="bold")
+    ax.set_xticks(x); ax.set_xticklabels(configs, rotation=30, ha="right", fontsize=8)
+    ax.set_ylabel("Median latency (µs)")
+    ax.set_title("dequantize")
+    ax.legend(loc="upper left", fontsize=9)
+
+    fig.suptitle(title, fontsize=12)
+    plt.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_pack_signs_speedup(rows: List[Dict], path: str,
+                             title: str = "pack_signs: scalar bit-OR vs warp-ballot PTX"):
+    """rows: {d, N, scalar:{median_us}, ptx:{median_us}, speedup_ptx_vs_scalar}."""
+    fig, ax = plt.subplots(figsize=(8.5, 4.5))
+    labels = [f"d={r['d']}, N={r['N']}" for r in rows]
+    x = np.arange(len(rows))
+    width = 0.38
+    scalar = [r["scalar"]["median_us"] for r in rows]
+    ptx    = [r["ptx"]["median_us"]    for r in rows]
+    speedups = [r["speedup_ptx_vs_scalar"] for r in rows]
+
+    ax.bar(x - width / 2, scalar, width, color=PAL["naive"], edgecolor="black",
+           linewidth=0.5, label="scalar (bit-OR loop)")
+    ax.bar(x + width / 2, ptx, width, color=PAL["prod"], edgecolor="black",
+           linewidth=0.5, label="PTX warp-ballot")
+
+    for xi, s, p, sp in zip(x, scalar, ptx, speedups):
+        y = max(s, p) * 1.04
+        ax.text(xi, y, f"{sp:.2f}×", ha="center", fontsize=10, fontweight="bold")
+
+    ax.set_xticks(x); ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=9)
+    ax.set_ylabel("Median latency (µs)")
+    ax.set_yscale("log")
+    ax.set_title(title)
+    ax.legend(loc="upper left", fontsize=9)
+    plt.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_fusion_speedup(rows: List[Dict], path: str,
                         title: str = "Kernel fusion: unfused vs fused TurboQuant_mse latency"):
     """rows: each dict has {config, direction, unfused_us, fused_us, speedup}."""

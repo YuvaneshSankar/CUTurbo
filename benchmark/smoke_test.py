@@ -98,6 +98,37 @@ def check_fused_equivalence(d=128, N=256, b=2, seed=3):
     assert max_err < 1e-5, f"fused dequant mismatch at b={b}: {max_err}"
 
 
+def check_ptx_equivalence(seed=7):
+    """fused_quantize_ptx must be bit-exact with fused_quantize (same math,
+    different instruction lowering for the pack loop). Likewise pack_signs_ptx
+    and pack_signs."""
+    from cuturbo.ext import get_ext
+    from cuturbo.codebook import build_codebook
+
+    torch.manual_seed(seed)
+    ext = get_ext()
+
+    # fused_quantize_ptx vs fused_quantize
+    d, N = 128, 4096
+    x = torch.randn(N, d, device="cuda", dtype=torch.float32)
+    x = x / x.norm(dim=1, keepdim=True).clamp_min(1e-12)
+    signs = torch.where(torch.randn(d, device="cuda") >= 0, 1.0, -1.0).float()
+    for b in (1, 2, 4):
+        cb = build_codebook(b, d, "cuda")
+        p_cuda = ext.fused_quantize(x, signs, cb, b)
+        p_ptx  = ext.fused_quantize_ptx(x, signs, cb, b)
+        assert torch.equal(p_cuda, p_ptx), f"fused_quantize_ptx mismatch at b={b}"
+        print(f"fused_quantize_ptx  b={b}: bit-exact ✓")
+
+    # pack_signs_ptx vs pack_signs across shapes
+    for d_ in (64, 128, 256, 512):
+        xx = torch.randn(1024, d_, device="cuda", dtype=torch.float32)
+        pk_c = ext.pack_signs(xx)
+        pk_p = ext.pack_signs_ptx(xx)
+        assert torch.equal(pk_c, pk_p), f"pack_signs_ptx mismatch at d={d_}"
+        print(f"pack_signs_ptx     d={d_}: bit-exact ✓")
+
+
 def check_prod(d=128, N=256, b=2, seed=3):
     torch.manual_seed(seed)
     x = torch.randn(N, d, device="cuda", dtype=torch.float32)
@@ -130,6 +161,9 @@ if __name__ == "__main__":
     print("=== Fused vs unfused kernel equivalence ===")
     for b in (1, 2, 4):
         check_fused_equivalence(b=b)
+    print()
+    print("=== PTX kernel equivalence ===")
+    check_ptx_equivalence()
     print()
     print("=== TurboQuant_prod unbiasedness ===")
     for b in (2, 3, 4):

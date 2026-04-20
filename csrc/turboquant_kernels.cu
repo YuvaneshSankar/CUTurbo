@@ -247,6 +247,89 @@ __global__ void fused_quantize_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Inline-PTX variant of fused_quantize_kernel.
+//
+// Uses `bfi.b32` (bitfield insert) for the per-word packing loop. Semantically
+// identical to the C++ `word |= (idx & MASK) << (i * B)` pattern, but forces
+// the compiler to emit exactly one bfi instruction per insertion — nvcc may
+// lower the C++ expression to the same instruction under -O3, but inline PTX
+// guarantees it and makes the generated code auditable. Everything else
+// (FWHT butterflies, centroid search, shared-mem layout) is copied verbatim
+// from fused_quantize_kernel so the benchmark delta is purely the pack path.
+// ---------------------------------------------------------------------------
+
+template <int B>
+__global__ void fused_quantize_ptx_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ signs,
+    const float* __restrict__ codebook,
+    uint32_t* __restrict__ packed,
+    int d,
+    float scale)
+{
+    constexpr int K = 1 << B;
+    constexpr int IDX_PER_WORD = 32 / B;
+
+    extern __shared__ float smem[];
+    uint8_t* sidx = reinterpret_cast<uint8_t*>(smem + d);
+
+    int tid = threadIdx.x;
+    int n   = blockIdx.x;
+
+    for (int c = tid; c < d; c += blockDim.x) {
+        smem[c] = x[n * d + c] * signs[c];
+    }
+    __syncthreads();
+
+    for (int h = 1; h < d; h <<= 1) {
+        int pairs = d >> 1;
+        for (int p = tid; p < pairs; p += blockDim.x) {
+            int i = ((p / h) << 1) * h + (p % h);
+            int j = i + h;
+            float a = smem[i];
+            float b = smem[j];
+            smem[i] = a + b;
+            smem[j] = a - b;
+        }
+        __syncthreads();
+    }
+
+    for (int c = tid; c < d; c += blockDim.x) {
+        float v = __fmul_rn(smem[c], scale);
+        float best_dist = 1e30f;
+        int   best_idx  = 0;
+        #pragma unroll
+        for (int k = 0; k < K; ++k) {
+            float diff = v - codebook[k];
+            float dist = diff * diff;
+            if (dist < best_dist) { best_dist = dist; best_idx = k; }
+        }
+        sidx[c] = static_cast<uint8_t>(best_idx);
+    }
+    __syncthreads();
+
+    int words_per_row = (d + IDX_PER_WORD - 1) / IDX_PER_WORD;
+    for (int w = tid; w < words_per_row; w += blockDim.x) {
+        uint32_t word = 0;
+        int base = w * IDX_PER_WORD;
+        #pragma unroll
+        for (int i = 0; i < IDX_PER_WORD; ++i) {
+            int c = base + i;
+            if (c < d) {
+                uint32_t idx = static_cast<uint32_t>(sidx[c]);
+                // bfi.b32 dst, src, base, start_bit, num_bits
+                // dst[start_bit + num_bits - 1 : start_bit] = src[num_bits-1 : 0]
+                // other bits of dst come from `base`.
+                asm("bfi.b32 %0, %1, %0, %2, %3;"
+                    : "+r"(word)
+                    : "r"(idx), "r"(i * B), "n"(B));
+            }
+        }
+        packed[n * words_per_row + w] = word;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Fused unpack-dequantize + inverse FWHT (MSE reverse path, single kernel)
 // ---------------------------------------------------------------------------
 //
@@ -330,6 +413,53 @@ __global__ void pack_signs_kernel(
             }
         }
         packed[n * words_per_row + w] = word;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Warp-ballot variant of pack_signs using inline PTX `vote.sync.ballot.b32`.
+// One warp (32 lanes) produces one 32-bit packed word in ONE PTX instruction,
+// replacing the 32-iteration scalar bit-OR loop. Threads-per-word goes from
+// 1 (scalar) to 32 (warp), so we use 32× more threads per word — the outer
+// loop iterates warps, not threads.
+// ---------------------------------------------------------------------------
+
+__global__ void pack_signs_ptx_kernel(
+    const float* __restrict__ x,
+    uint32_t* __restrict__ packed,
+    int d)
+{
+    int tid = threadIdx.x;
+    int n   = blockIdx.x;
+    int words_per_row = (d + 31) / 32;
+
+    int lane = tid & 31;
+    int warp_id = tid >> 5;
+    int warps_per_block = blockDim.x >> 5;
+
+    for (int w = warp_id; w < words_per_row; w += warps_per_block) {
+        int c = w * 32 + lane;
+        int pred = 0;
+        if (c < d) {
+            float v = x[n * d + c];
+            pred = (v >= 0.0f) ? 1 : 0;
+        }
+        // Inline PTX: convert the int predicate to a real predicate register,
+        // then ballot across the full warp. The ballot result is bit-i=pred of
+        // lane i — exactly the packed sign word we want.
+        uint32_t ballot;
+        asm volatile(
+            "{\n\t"
+            "  .reg .pred p;\n\t"
+            "  setp.ne.s32 p, %1, 0;\n\t"
+            "  vote.sync.ballot.b32 %0, p, 0xffffffff;\n\t"
+            "}"
+            : "=r"(ballot)
+            : "r"(pred)
+        );
+        if (lane == 0) {
+            packed[n * words_per_row + w] = ballot;
+        }
     }
 }
 
@@ -525,6 +655,79 @@ torch::Tensor fused_quantize(torch::Tensor x, torch::Tensor signs,
     return packed;
 }
 
+torch::Tensor fused_quantize_ptx(torch::Tensor x, torch::Tensor signs,
+                                  torch::Tensor codebook, int64_t B) {
+    check_cuda_tensor(x, "x");
+    check_cuda_tensor(signs, "signs");
+    check_cuda_tensor(codebook, "codebook");
+    TORCH_CHECK(x.dtype() == torch::kFloat32);
+    TORCH_CHECK(signs.dtype() == torch::kFloat32);
+    TORCH_CHECK(codebook.dtype() == torch::kFloat32);
+    TORCH_CHECK(x.dim() == 2);
+    TORCH_CHECK(B == 1 || B == 2 || B == 4);
+    TORCH_CHECK(codebook.numel() == (1LL << B));
+
+    int N = x.size(0);
+    int d = x.size(1);
+    TORCH_CHECK((d & (d - 1)) == 0 && d >= 2);
+    TORCH_CHECK(signs.numel() == d);
+
+    int idx_per_word = 32 / (int)B;
+    int words_per_row = (d + idx_per_word - 1) / idx_per_word;
+    auto opts = torch::TensorOptions().dtype(torch::kInt32).device(x.device());
+    auto packed = torch::empty({N, words_per_row}, opts);
+
+    float scale = 1.0f / std::sqrt((float)d);
+    int block = pick_block_size(d);
+    size_t shmem = d * sizeof(float) + d * sizeof(uint8_t);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    if (B == 1) {
+        fused_quantize_ptx_kernel<1><<<N, block, shmem, stream>>>(
+            x.data_ptr<float>(), signs.data_ptr<float>(), codebook.data_ptr<float>(),
+            reinterpret_cast<uint32_t*>(packed.data_ptr<int32_t>()), d, scale);
+    } else if (B == 2) {
+        fused_quantize_ptx_kernel<2><<<N, block, shmem, stream>>>(
+            x.data_ptr<float>(), signs.data_ptr<float>(), codebook.data_ptr<float>(),
+            reinterpret_cast<uint32_t*>(packed.data_ptr<int32_t>()), d, scale);
+    } else {
+        fused_quantize_ptx_kernel<4><<<N, block, shmem, stream>>>(
+            x.data_ptr<float>(), signs.data_ptr<float>(), codebook.data_ptr<float>(),
+            reinterpret_cast<uint32_t*>(packed.data_ptr<int32_t>()), d, scale);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return packed;
+}
+
+torch::Tensor pack_signs_ptx(torch::Tensor x) {
+    check_cuda_tensor(x, "x");
+    TORCH_CHECK(x.dtype() == torch::kFloat32);
+    TORCH_CHECK(x.dim() == 2);
+
+    int N = x.size(0);
+    int d = x.size(1);
+    int words_per_row = (d + 31) / 32;
+
+    auto opts = torch::TensorOptions().dtype(torch::kInt32).device(x.device());
+    auto packed = torch::empty({N, words_per_row}, opts);
+
+    // Block must be a multiple of 32 (warp size) and hold enough warps to
+    // cover words_per_row in one sweep when possible.
+    int target = words_per_row * 32;
+    int block;
+    if      (target <= 64)   block = 64;
+    else if (target <= 128)  block = 128;
+    else if (target <= 256)  block = 256;
+    else                      block = 256;
+
+    pack_signs_ptx_kernel<<<N, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+        x.data_ptr<float>(),
+        reinterpret_cast<uint32_t*>(packed.data_ptr<int32_t>()),
+        d);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return packed;
+}
+
 torch::Tensor fused_dequantize(torch::Tensor packed, torch::Tensor signs,
                                 torch::Tensor codebook, int64_t B, int64_t d) {
     check_cuda_tensor(packed, "packed");
@@ -611,6 +814,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("unpack_dequantize", &unpack_dequantize, "Bit-unpack + codebook lookup");
     m.def("fused_quantize",    &fused_quantize,    "Fused fwht_forward + quantize_pack (one kernel)");
     m.def("fused_dequantize",  &fused_dequantize,  "Fused unpack_dequantize + fwht_inverse (one kernel)");
+    m.def("fused_quantize_ptx",&fused_quantize_ptx,"Fused quantize with inline PTX bfi.b32 packing");
+    m.def("pack_signs_ptx",    &pack_signs_ptx,    "Pack sign bits using warp-ballot vote.sync.ballot.b32");
     m.def("pack_signs",        &pack_signs,        "Pack sign bits to uint32 words");
     m.def("unpack_signs",      &unpack_signs,      "Unpack sign bits to ±1 floats");
 }

@@ -180,6 +180,66 @@ Full sweep in `results/fusion/summary.csv`. Summary across all 15 configs: **qua
 
 ---
 
+## Inline PTX — where it helps, where it doesn't
+
+Two places in the pipeline have clean inline-PTX implementations worth comparing against the CUDA C++ version. Both are **bit-exact** with their non-PTX counterparts — verified by `benchmark/smoke_test.py::check_ptx_equivalence`.
+
+### 1. `pack_signs` via `vote.sync.ballot.b32` — **~2× speedup, real and consistent**
+
+The scalar `pack_signs_kernel` runs a 32-iteration bit-OR loop per word, with one thread per output word. The PTX version uses a warp of 32 lanes and collects the per-lane sign bits into one 32-bit word via `vote.sync.ballot.b32` in a single instruction. 32 scalar ORs collapse to one warp vote.
+
+| d | N | scalar (µs) | PTX warp-ballot (µs) | **speedup** |
+|---|---|---|---|---|
+| 128 | 65 536 | 460.8 | 226.3 | **2.04×** |
+| 128 | 262 144 | 2211.8 | 1053.7 | **2.10×** |
+| 256 | 65 536 | 1140.7 | 541.7 | **2.11×** |
+| 256 | 262 144 | 4177.4 | 1992.7 | **2.10×** |
+| 512 | 65 536 | 1682.9 | 970.8 | 1.73× |
+| 512 | 262 144 | 6870.6 | 3872.8 | 1.77× |
+
+![pack_signs PTX speedup](results/fusion/fig_pack_signs_ptx.png)
+
+The speedup tapers at `d = 512` because the kernel is hitting HBM bandwidth limits — at 2 MB/s output and many warps per block, both versions start to saturate the memory subsystem. For `d ≤ 256`, where compute dominates, the 2× PTX win is flat.
+
+This is exactly the kind of operation PTX intrinsics were designed for: a warp-level reduction with no clean C++ expression. The SASS listing for the PTX kernel shows a single `VOTE.ALL` instruction producing the word, vs ~32 shift/OR instructions in the scalar kernel.
+
+### 2. `fused_quantize` with `bfi.b32` bit-packing — **no measurable speedup**
+
+The packing loop inside `fused_quantize_kernel<B>` is a sequence of `word |= (idx & MASK) << (i * B)` operations. Inline PTX replaces these with explicit `bfi.b32 dst, src, dst, pos, num_bits` (bitfield-insert) instructions.
+
+| config | fused CUDA C++ (µs) | fused + PTX bfi (µs) | **speedup** |
+|---|---|---|---|
+| d=128, N=65 536, b=2 | 965.7 | 955.9 | 1.01× |
+| d=128, N=262 144, b=2 | 4248.6 | 4219.4 | 1.01× |
+| d=256, N=65 536, b=2 | 2174.6 | 2169.3 | 1.00× |
+| d=256, N=262 144, b=2 | 9870.3 | 9750.5 | 1.01× |
+| d=512, N=65 536, b=2 | 4571.1 | 4881.9 | 0.94× |
+| (full sweep across b ∈ {1, 2, 4}) | — | — | 0.92–1.11× |
+
+**No win from explicit PTX.** nvcc is already lowering the C++ shift/OR pattern to `bfi.b32` under `-O3` (confirmed by inspecting the SASS). The inline PTX version emits the same instructions, so the delta is noise — some configs come out slightly faster, some slightly slower, nothing consistent.
+
+This is the honest counterpart to the pack_signs result: PTX only helps when it exposes a hardware primitive the C++ version can't express. When the compiler is already generating the optimal instruction, rewriting the same operation in inline asm is cosmetic.
+
+### Combined three-column view of the MSE quantize path
+
+![Fused + PTX comparison](results/fusion/fig_fusion_speedup.png)
+
+Left subplot (quantize) shows three bars — unfused / fused / fused+PTX — at each config. The `fused` vs `unfused` improvement (1.00–1.24×) is the real win; the `fused+PTX` bar tracks `fused` almost exactly. Right subplot (dequantize) shows two bars — there's no PTX dequant variant because the dequantize kernel doesn't have a packing loop to optimise.
+
+### Summary
+
+| Change | Expressed as | Speedup | Reason |
+|---|---|---|---|
+| Two kernels → one fused | CUDA C++ kernel fusion | 1.10–1.25× (quantize), 1.17–1.41× (dequantize) | Skips HBM round-trip of intermediate `y` |
+| `word \|= idx << shift` → `bfi.b32` | Inline PTX | 1.00× (within noise) | nvcc already emits this instruction |
+| 32-iteration bit-OR loop → warp ballot | Inline PTX (`vote.sync.ballot.b32`) | **~2.0× (pack_signs)** | Warp-level primitive has no clean C++ form |
+
+Takeaway: **PTX is worth the readability tax only for warp/lane-level primitives that C++ can't express directly**. For straight-line arithmetic, trust the compiler.
+
+Raw data: `results/fusion/summary.csv`, `results/fusion/raw/fusion.json`.
+
+---
+
 ## Methodology
 
 ### Synthetic microbenchmark (`benchmark/run_benchmark.py`)
