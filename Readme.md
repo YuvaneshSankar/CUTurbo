@@ -76,24 +76,6 @@ results/sift/                  # SIFT-1M: 4 figures, summary.csv, env.json, raw/
 
 ---
 
-## Hardware & software
-
-Captured at benchmark time and dumped into `results/env.json` / `results/sift/env.json`:
-
-| Item | Value |
-|---|---|
-| GPU | NVIDIA GeForce RTX 3050 Laptop GPU |
-| VRAM | 3778 MiB |
-| Compute capability | sm_86 (Ampere) |
-| SM count | 16 |
-| Theoretical peak memory bandwidth | 192 GB/s (GDDR6 128-bit @ 12 Gbps) |
-| Driver | 570.211.01 |
-| CUDA runtime | 12.8 |
-| PyTorch | 2.10.0+cu128 |
-| Python | 3.11.14 |
-
----
-
 ## The paper in one page
 
 TurboQuant quantizes unit-norm vectors `x ∈ ℝᵈ` in a data-oblivious, online way. Two variants:
