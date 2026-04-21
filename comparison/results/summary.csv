@@ -1,0 +1,13 @@
+d,N,variant,median_us,p05_us,p95_us,D_mse
+128,8192,ours unfused (prod b=3),701.44,609.28,1826.61,0.0014
+128,8192,ours fused (prod b=3),668.16,644.10,2071.81,0.0014
+128,8192,ours fused+PTX (prod b=3),617.47,579.58,2147.74,0.0014
+128,8192,his PyTorch reference (cuTile unavailable on this driver),2434.05,2104.32,4459.16,0.0014
+128,32768,ours unfused (prod b=3),3826.18,3064.78,5906.38,0.0014
+128,32768,ours fused (prod b=3),3410.98,2618.37,4515.79,0.0014
+128,32768,ours fused+PTX (prod b=3),3234.82,2466.82,4371.35,0.0014
+128,32768,his PyTorch reference (cuTile unavailable on this driver),11746.30,8648.04,15269.63,0.0014
+128,65536,ours unfused (prod b=3),8545.28,6813.13,11260.01,0.0014
+128,65536,ours fused (prod b=3),7275.52,5247.95,10124.08,0.0014
+128,65536,ours fused+PTX (prod b=3),6965.76,5530.98,9131.57,0.0014
+128,65536,his PyTorch reference (cuTile unavailable on this driver),24061.95,18044.37,29751.04,0.0014

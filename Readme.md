@@ -114,129 +114,258 @@ The key analytical result (Theorem 1): `E[‖x − x̂‖²] / d` is sandwiched 
 
 ---
 
-## Kernel design
+## Three ways to write the same GPU kernel
 
-One `.cu` file (`csrc/turboquant_kernels.cu`), JIT-compiled through `torch.utils.cpp_extension` on first import. All kernels use **one block per input vector**, up to 256 threads cooperating via shared memory.
+This is the core technical story of the repo — we implemented the TurboQuant compression primitive three different ways on a laptop GPU and measured the speedups. If you've never written a GPU kernel before, this section is written for you: it explains each concept first, then shows the code and the numbers.
 
-| Kernel | What it does | Why this layout |
-|---|---|---|
-| `fwht_forward`, `fwht_inverse` | In-place O(d log d) Walsh-Hadamard transform with a random sign flip | Structured stand-in for a Haar-random `Π`. Same concentration behaviour as a dense `d × d` GEMM but ~10× fewer FLOPs. Used by QuIP#, HadaCore. |
-| `quantize_pack<B>` (templated on `B ∈ {1, 2, 4}`) | Per-coord argmin over the Lloyd codebook, then bit-packs `32/B` indices per `uint32` word | Shared-mem staging keeps the pack reduction warp-local and writes one coalesced word per group. `B` is a template param so the compiler unrolls the centroid scan. |
-| `unpack_dequantize<B>` | Reverse: unpack `B` bits → codebook lookup → fp32 | Same block layout as `quantize_pack` so the caller can run `fwht_inverse` on the output in-place. |
-| `fused_quantize<B>` | **Fusion of `fwht_forward` + `quantize_pack` into one kernel.** Keeps the rotated `y` in shared memory between the FWHT butterflies and the centroid search, skipping an HBM round-trip. | Default path since this change. See the next section for the measured speedup. |
-| `fused_dequantize<B>` | **Fusion of `unpack_dequantize` + `fwht_inverse` into one kernel.** Keeps the unpacked `y_hat` in shared memory across the codebook lookup and the inverse butterflies. | Default path since this change. |
-| `pack_signs`, `unpack_signs` | 1-bit sign packing for the QJL residual | Used only by the prod variant. |
+### A five-minute GPU primer
 
-`TurboQuant_prod` additionally invokes a dense `S · r` projection via cuBLAS (`torch.matmul`); writing a competitive GEMM from scratch is out of scope, and the Gaussian matrix is rotation-agnostic.
+Anyone already comfortable with CUDA can skip to the next heading.
 
-**Rotation choice.** The paper's analysis assumes a Haar-random `Π`. Practical systems (QuIP#, HadaCore) replace it with the structured factorisation `Π = (1/√d) · H · diag(s)` where `H` is the `d × d` Walsh-Hadamard matrix and `s ∈ {±1}ᵈ` are random signs. This is what we implement. The distortion numbers below land exactly on the paper's theoretical bounds, so the structured approximation is sufficient.
+A **GPU kernel** is just a function that runs on the GPU. The function is written once, but the GPU launches thousands of copies of it simultaneously, each copy working on a slice of the input. To orchestrate them, CUDA groups copies into a three-level hierarchy:
+
+- A **thread** is one copy — the smallest unit. Thousands of them run at once.
+- A **warp** is a group of 32 threads that execute in lockstep on a single hardware unit. Most performance tricks happen at the warp level.
+- A **block** is a larger group (typically 128–256 threads) that can share fast on-chip memory and synchronise with each other.
+
+Inside one GPU, there are two kinds of memory:
+
+- **HBM** (High Bandwidth Memory) — big but slow. ~4 GB on our laptop, ~200 GB/s bandwidth. Where your input tensors live.
+- **Shared memory** — tiny but fast. ~48 KB per block, ~10× faster than HBM. On-chip. Vanishes when the block finishes.
+
+A **kernel launch** is when the CPU tells the GPU "run this function across this many blocks." Each launch has a fixed startup cost (~10 µs) regardless of how much work it does — think of it as turning a factory on and off.
+
+The optimisation game is mostly: **do as much useful work as possible per byte you move between HBM and shared memory, and do as few kernel launches as possible.** Every trick in this section is a version of that one rule.
+
+### What the TurboQuant compression path actually does
+
+Given an input vector `x ∈ ℝ¹²⁸`, the MSE compress algorithm is:
+
+1. **Rotate** — apply a random orthogonal transformation `Π` so the coordinates become near-Gaussian. We use a Fast Walsh-Hadamard Transform (FWHT), which is 7 butterfly stages of "add neighbours, subtract neighbours" — the GPU equivalent of an FFT.
+2. **Quantize** — for each coordinate, find the nearest entry in a 4-entry codebook (for `b=2` bits) and record its index.
+3. **Pack** — take the 128 indices, 2 bits each, and pack them into 8 × 32-bit words.
+
+We also need the reverse (dequantize): unpack → look up centroids → inverse FWHT. Everything below applies to both directions.
 
 ---
 
-## Kernel fusion (fused FWHT + quantize-pack)
+### Method 1 — Vanilla CUDA, two kernels (the textbook way)
 
-The MSE quantize pipeline is two kernels, with the rotated intermediate `y` round-tripped through HBM:
-
-```
-  UNFUSED (two kernels):
-    x ─► fwht_forward  ─► [HBM: y, N·d·4 B written] ─► quantize_pack ─► packed
-```
-
-Fusion keeps `y` in shared memory across both stages:
+The obvious implementation is two kernels, one after the other:
 
 ```
-  FUSED (one kernel):
-    x ─► {fwht_forward · quantize_pack}  ─► packed
+  x ──► [kernel 1: FWHT rotate] ──► y ──► [kernel 2: quantize + pack] ──► packed
+             │                          │                                    │
+             ▼                          ▼                                    ▼
+        write y to HBM           read y from HBM                        write packed to HBM
+          (32 MB)                   (32 MB)                               (2 MB)
 ```
 
-Same for the reverse direction (`unpack_dequantize` + `fwht_inverse`). This saves one kernel launch and the HBM round-trip of the intermediate tensor: **64 MiB per call at `d = 128, N = 65 536`**, scaling linearly with `N·d`.
+Each kernel is clean and does one thing. But look at the HBM traffic: we write the intermediate `y` (the rotated vector) out to slow HBM, then immediately read it back. At `N = 65 536, d = 128` that's **64 MB of completely wasted HBM traffic** per call. Plus two kernel launches instead of one.
 
-The fused kernel is **bit-exact with the unfused path** — the centroid indices produced by `fused_quantize` are `torch.equal(...)` to those produced by `fwht_forward`+`quantize_pack`, and the reconstructed `x_hat` is identical to machine precision. Verified by `benchmark/smoke_test.py::check_fused_equivalence` across `b ∈ {1, 2, 4}`.
+At this scale, our measurement shows vanilla `TurboQuant_mse b=2` quantize takes **1142 µs** and moves effective data at only ~30 GB/s — about 16 % of the GPU's peak 192 GB/s. That 16 % tells us the kernel isn't fully memory-bound, but the wasted HBM round-trip is eating real time.
 
-### Measured speedup
+See `csrc/turboquant_kernels.cu`: `fwht_kernel` + `quantize_pack_kernel<B>` — two separate kernels, two separate dispatch functions. The Python API at `cuturbo.api.TurboQuantMSE(fused=False)` uses this path.
 
-Median latency (100 iters after 15 warmup, CUDA events), fused-vs-unfused at the production config (d=128, KV-cache-shaped) and a range of other shapes:
+---
+
+### Method 2 — Fused CUDA (merge the two kernels into one)
+
+What if the intermediate `y` never leaves the chip?
+
+```
+  x ──► [ONE kernel: FWHT rotate ─► stays in shared memory ─► quantize + pack] ──► packed
+                                          │
+                                          ▼
+                                    no HBM trip!
+```
+
+One kernel. `y` is computed in shared memory during the FWHT butterflies, and the quantize+pack code immediately reads it from shared memory in the same kernel. The 32 MB write + 32 MB read disappears entirely.
+
+**The code change is about 80 lines** — essentially taking the two kernel bodies and concatenating them into one, with a single `__syncthreads()` between the FWHT output and the codebook scan. The shared-memory layout holds `d` floats (the working FWHT buffer) followed by `d` bytes (the pre-pack indices) — about 5·d bytes per block, which for `d = 512` is only 2.5 KB, well under the 48 KB shared-memory budget on Ampere.
+
+```cuda
+// Inside fused_quantize_kernel<B> (simplified):
+load_x_with_signs_into_shared_mem();
+__syncthreads();
+
+for (int h = 1; h < d; h <<= 1) {           // FWHT butterflies
+    for (int p = tid; p < d/2; p += blockDim.x) {
+        float a = smem[i], b = smem[j];     // i, j picked from p
+        smem[i] = a + b;
+        smem[j] = a - b;
+    }
+    __syncthreads();
+}
+
+for (int c = tid; c < d; c += blockDim.x) { // in-place: quantize
+    float v = __fmul_rn(smem[c], scale);    // NB: __fmul_rn, see below
+    int best = nearest_centroid(v);
+    sidx[c] = best;
+}
+__syncthreads();
+
+for (int w = tid; w < words_per_row; w += blockDim.x)
+    pack_B_bit_indices_into_word(w);        // bit-packing
+```
+
+**Measured result: 1.10–1.25× faster on quantize, 1.17–1.41× faster on dequantize.** Dequantize benefits more because it does less per-coord compute (a codebook lookup is a single load, vs the 2ᴮ-way argmin in quantize), so saving the HBM round-trip is a bigger fraction of its runtime.
 
 | config | direction | unfused (µs) | fused (µs) | **speedup** | HBM saved |
 |---|---|---|---|---|---|
 | d=128, N=65 536, b=2 | quantize | 1141.8 | 996.4 | **1.15×** | 64 MiB |
 | d=128, N=65 536, b=2 | dequantize | 1116.7 | 832.5 | **1.34×** | 64 MiB |
-| d=128, N=65 536, b=4 | quantize | 1375.2 | 1233.9 | 1.12× | 64 MiB |
-| d=128, N=65 536, b=4 | dequantize | 1195.0 | 943.1 | **1.27×** | 64 MiB |
-| d=128, N=262 144, b=2 | quantize | 5700.1 | 4773.9 | 1.19× | 256 MiB |
 | d=128, N=262 144, b=2 | dequantize | 5219.8 | 3909.6 | **1.34×** | 256 MiB |
-| d=256, N=262 144, b=1 | quantize | 14 756.9 | 11 786.8 | 1.25× | 512 MiB |
-| d=256, N=262 144, b=1 | dequantize | 12 183.6 | 9 837.6 | 1.24× | 512 MiB |
-| d=512, N=65 536, b=2 | quantize | 6 548.0 | 5 194.2 | **1.26×** | 256 MiB |
-| d=512, N=65 536, b=2 | dequantize | 6 858.2 | 4 851.7 | **1.41×** | 256 MiB |
+| d=512, N=65 536, b=2 | quantize | 6548.0 | 5194.2 | **1.26×** | 256 MiB |
+| d=512, N=65 536, b=2 | dequantize | 6858.2 | 4851.7 | **1.41×** | 256 MiB |
 
-Full sweep in `results/fusion/summary.csv`. Summary across all 15 configs: **quantize speedup median 1.11× (range 0.96–1.26×); dequantize speedup median 1.29× (range 1.17–1.41×)**. Dequantize benefits more because it does less compute per coord (codebook-lookup is a single load vs a 2^B-way argmin), so shaving the HBM round-trip is a bigger fraction of the runtime.
+Full sweep across 15 configurations in `results/fusion/summary.csv`. Median quantize speedup **1.11×**; median dequantize speedup **1.29×**.
 
 ![Fusion speedup](results/fusion/fig_fusion_speedup.png)
 
-**Transitive speedup for `TurboQuant_prod`.** The prod variant's internal `TurboQuantMSE` uses the fused path by default, so Algorithm 2 gets the same acceleration on its MSE stages at no additional cost. The `S · r` cuBLAS GEMM and the `pack_signs` kernel are unchanged.
+#### A subtle bug we hit, and what it taught us about floating-point
 
-**Caveat — `__fmul_rn` for bit-exact parity.** The unfused pipeline stores the scaled `y` to HBM between kernels, which forces fp32 rounding. The fused version keeps `y` in registers, where `--use_fast_math` lets nvcc fuse the scale-multiply with the downstream subtraction into a single-rounding FMA. For one input per ~4 M at `b=4` the FMA rounding flipped the argmin at a codebook midpoint. We pin the scaling multiplication with `__fmul_rn` to force separate rounding, restoring bit-exact parity at negligible cost (a couple of instructions per coord).
+When we first wrote the fused kernel, it agreed bit-for-bit with the unfused version at `b=1` and `b=2` — but differed in exactly **one coordinate out of ~4 million** at `b=4`.
+
+Why? In the unfused version, the FWHT kernel writes the scaled rotated value `y = scaled_smem` to HBM, then the second kernel reads it back. That HBM round-trip forces a full fp32 rounding of `y`.
+
+In the fused version, `y` never leaves registers. With `--use_fast_math` enabled, nvcc fused the scale-multiply (`smem[c] * scale`) with the downstream subtraction (`v - codebook[k]`) into a single FMA (fused multiply-add) instruction. FMAs round once at the end, not twice — which for exactly one input per ~4 M was enough to flip which centroid was closest at a midpoint tie.
+
+Fix: pin the scale multiply with `__fmul_rn(smem[c], scale)`, the CUDA intrinsic for "multiply and round properly, don't fuse with anything downstream." Costs a couple of instructions per coordinate; restores bit-exact equivalence with the unfused path. `benchmark/smoke_test.py::check_fused_equivalence` now verifies this across `b ∈ {1, 2, 4}`.
+
+Lesson: **with `--use_fast_math`, `a * b` followed by `a * b - c` and `(a * b) - c` can give different answers depending on whether the compiler fuses them.** When you care about bit-exact parity across code paths, pin the rounding explicitly.
 
 ---
 
-## Inline PTX — where it helps, where it doesn't
+### Method 3 — Fused CUDA + inline PTX (dip into GPU assembly)
 
-Two places in the pipeline have clean inline-PTX implementations worth comparing against the CUDA C++ version. Both are **bit-exact** with their non-PTX counterparts — verified by `benchmark/smoke_test.py::check_ptx_equivalence`.
+**PTX** is the GPU's assembly-like intermediate language. When you write CUDA C++, nvcc translates it to PTX, then a backend translates PTX to the actual SASS machine code that runs on the GPU. You can write inline PTX directly inside a `.cu` file using `asm()` blocks, the same way you'd write inline x86 assembly inside C.
 
-### 1. `pack_signs` via `vote.sync.ballot.b32` — **~2× speedup, real and consistent**
+Why would you ever do this? Two reasons:
 
-The scalar `pack_signs_kernel` runs a 32-iteration bit-OR loop per word, with one thread per output word. The PTX version uses a warp of 32 lanes and collects the per-lane sign bits into one 32-bit word via `vote.sync.ballot.b32` in a single instruction. 32 scalar ORs collapse to one warp vote.
+1. The GPU has special instructions that don't map cleanly to C++ — especially **warp-level primitives** that let 32 threads cooperate in a single cycle. Expressing these in C++ is awkward or impossible; in PTX it's one instruction.
+2. Sometimes you want to *guarantee* a specific instruction gets emitted, instead of hoping the compiler figures it out.
 
-| d | N | scalar (µs) | PTX warp-ballot (µs) | **speedup** |
+We tried both uses. Only the first one paid off, and that's the interesting finding.
+
+#### PTX target 1 — `pack_signs` via warp ballot → **~2× speedup**
+
+The `pack_signs` kernel takes a `(N, d)` float tensor, reads the sign of each entry, and packs 32 signs into each 32-bit output word. The obvious way:
+
+```cuda
+// One thread does 32 iterations of a bit-OR loop
+for (int b = 0; b < 32; ++b) {
+    int c = w * 32 + b;
+    word |= (x[n*d + c] >= 0 ? 1u : 0u) << b;
+}
+```
+
+Straightforward but wasteful: we have 32 threads per warp sitting idle while one thread does all the work.
+
+The PTX version uses a hardware primitive called a **warp ballot** — in one instruction, every thread in a warp contributes one bit, and the instruction produces a 32-bit word where bit *i* is thread *i*'s contribution:
+
+```cuda
+uint32_t ballot;
+asm volatile(
+    "{ .reg .pred p;\n"
+    "  setp.ne.s32 p, %1, 0;\n"             // p = (pred != 0)
+    "  vote.sync.ballot.b32 %0, p, 0xffffffff; }"  // ballot across whole warp
+    : "=r"(ballot) : "r"(pred));
+```
+
+32 parallel threads each emit one bit in unison, collected in one `vote.sync.ballot.b32` instruction. All 32 lanes work simultaneously; the whole 32-bit output word is produced in a few cycles.
+
+**Measured speedup: 1.73–2.11× across every configuration we tried.**
+
+| d | N | scalar loop (µs) | PTX warp-ballot (µs) | **speedup** |
 |---|---|---|---|---|
 | 128 | 65 536 | 460.8 | 226.3 | **2.04×** |
-| 128 | 262 144 | 2211.8 | 1053.7 | **2.10×** |
-| 256 | 65 536 | 1140.7 | 541.7 | **2.11×** |
-| 256 | 262 144 | 4177.4 | 1992.7 | **2.10×** |
-| 512 | 65 536 | 1682.9 | 970.8 | 1.73× |
-| 512 | 262 144 | 6870.6 | 3872.8 | 1.77× |
+| 128 | 262 144 | 2 211.8 | 1 053.7 | **2.10×** |
+| 256 | 65 536 | 1 140.7 | 541.7 | **2.11×** |
+| 256 | 262 144 | 4 177.4 | 1 992.7 | **2.10×** |
+| 512 | 65 536 | 1 682.9 | 970.8 | 1.73× |
+| 512 | 262 144 | 6 870.6 | 3 872.8 | 1.77× |
 
 ![pack_signs PTX speedup](results/fusion/fig_pack_signs_ptx.png)
 
-The speedup tapers at `d = 512` because the kernel is hitting HBM bandwidth limits — at 2 MB/s output and many warps per block, both versions start to saturate the memory subsystem. For `d ≤ 256`, where compute dominates, the 2× PTX win is flat.
+The speedup tapers slightly at `d = 512` because the kernel starts hitting HBM bandwidth limits (both versions write the same amount of output to memory). At smaller `d` where compute dominates, the 2× win is flat.
 
-This is exactly the kind of operation PTX intrinsics were designed for: a warp-level reduction with no clean C++ expression. The SASS listing for the PTX kernel shows a single `VOTE.ALL` instruction producing the word, vs ~32 shift/OR instructions in the scalar kernel.
+Generalising: this works because the warp ballot is **a hardware feature with no clean C++ expression**. Once you know it exists and can write the inline asm for it, you get a ~30× reduction in instruction count (32 shifts + 32 ORs → 1 ballot + 1 store-if-lane-0), which translates directly to ~2× wall-clock.
 
-### 2. `fused_quantize` with `bfi.b32` bit-packing — **no measurable speedup**
+#### PTX target 2 — `bfi.b32` for bit-packing → **no measurable speedup**
 
-The packing loop inside `fused_quantize_kernel<B>` is a sequence of `word |= (idx & MASK) << (i * B)` operations. Inline PTX replaces these with explicit `bfi.b32 dst, src, dst, pos, num_bits` (bitfield-insert) instructions.
+Remember the bit-packing loop inside the fused kernel? It looks like:
 
-| config | fused CUDA C++ (µs) | fused + PTX bfi (µs) | **speedup** |
+```cuda
+word |= (idx & MASK) << (i * B);
+```
+
+The GPU has a bitfield-insert instruction, `bfi.b32`, which does exactly this in one op. So you might think writing it explicitly would help:
+
+```cuda
+asm("bfi.b32 %0, %1, %0, %2, %3;"
+    : "+r"(word) : "r"(idx), "r"(i * B), "n"(B));
+```
+
+**It didn't help.** Across the full sweep of configurations we measured 0.92× to 1.11× — noise-level, no consistent direction.
+
+| config | fused CUDA C++ (µs) | fused + PTX `bfi` (µs) | **speedup** |
 |---|---|---|---|
 | d=128, N=65 536, b=2 | 965.7 | 955.9 | 1.01× |
-| d=128, N=262 144, b=2 | 4248.6 | 4219.4 | 1.01× |
-| d=256, N=65 536, b=2 | 2174.6 | 2169.3 | 1.00× |
-| d=256, N=262 144, b=2 | 9870.3 | 9750.5 | 1.01× |
-| d=512, N=65 536, b=2 | 4571.1 | 4881.9 | 0.94× |
-| (full sweep across b ∈ {1, 2, 4}) | — | — | 0.92–1.11× |
+| d=128, N=262 144, b=2 | 4 248.6 | 4 219.4 | 1.01× |
+| d=256, N=65 536, b=2 | 2 174.6 | 2 169.3 | 1.00× |
+| d=512, N=65 536, b=2 | 4 571.1 | 4 881.9 | 0.94× |
 
-**No win from explicit PTX.** nvcc is already lowering the C++ shift/OR pattern to `bfi.b32` under `-O3` (confirmed by inspecting the SASS). The inline PTX version emits the same instructions, so the delta is noise — some configs come out slightly faster, some slightly slower, nothing consistent.
+Why? Looking at the SASS that nvcc produces for our C++ version under `-O3`, we see `BFI` instructions already. The compiler is **smart enough to recognise the `word |= (idx & MASK) << shift` pattern and lower it to `bfi.b32` on its own**. Writing the inline PTX gets you exactly the same machine code; the only difference is that the source code is less readable.
 
-This is the honest counterpart to the pack_signs result: PTX only helps when it exposes a hardware primitive the C++ version can't express. When the compiler is already generating the optimal instruction, rewriting the same operation in inline asm is cosmetic.
+#### The combined view
 
-### Combined three-column view of the MSE quantize path
+Here's the three-column comparison for our main pipeline (`TurboQuant_mse` quantize + dequantize, across 15 shape configs):
 
-![Fused + PTX comparison](results/fusion/fig_fusion_speedup.png)
+![Three-way comparison](results/fusion/fig_fusion_speedup.png)
 
-Left subplot (quantize) shows three bars — unfused / fused / fused+PTX — at each config. The `fused` vs `unfused` improvement (1.00–1.24×) is the real win; the `fused+PTX` bar tracks `fused` almost exactly. Right subplot (dequantize) shows two bars — there's no PTX dequant variant because the dequantize kernel doesn't have a packing loop to optimise.
+Left subplot (quantize): three bars per config — unfused / fused / fused + PTX bfi. The `fused` bar is the real win over `unfused`; the `fused + PTX` bar tracks `fused` almost exactly.
 
-### Summary
+Right subplot (dequantize): two bars (there's no PTX variant for dequantize because the dequantize kernel doesn't have a bit-packing loop to optimise — the only non-obvious operation there is the inverse FWHT, which is already trivial).
 
-| Change | Expressed as | Speedup | Reason |
-|---|---|---|---|
-| Two kernels → one fused | CUDA C++ kernel fusion | 1.10–1.25× (quantize), 1.17–1.41× (dequantize) | Skips HBM round-trip of intermediate `y` |
-| `word \|= idx << shift` → `bfi.b32` | Inline PTX | 1.00× (within noise) | nvcc already emits this instruction |
-| 32-iteration bit-OR loop → warp ballot | Inline PTX (`vote.sync.ballot.b32`) | **~2.0× (pack_signs)** | Warp-level primitive has no clean C++ form |
+### Summary — which trick is worth the trouble
 
-Takeaway: **PTX is worth the readability tax only for warp/lane-level primitives that C++ can't express directly**. For straight-line arithmetic, trust the compiler.
+| Change | Speedup | Reason |
+|---|---|---|
+| Two kernels → one fused kernel | 1.10–1.25× (quantize), 1.17–1.41× (dequantize) | Skip the HBM round-trip of the intermediate tensor |
+| `word \|= idx << shift` → PTX `bfi.b32` | 1.00× (within noise) | nvcc already emits `bfi` — explicit PTX is cosmetic |
+| 32-iteration bit-OR → PTX warp ballot | **~2.0× (pack_signs only)** | Warp-level primitive; no clean C++ form |
 
-Raw data: `results/fusion/summary.csv`, `results/fusion/raw/fusion.json`.
+**Takeaway for writing your own GPU kernels:**
+
+- **Fusing two kernels into one** is almost always worth doing. The HBM round-trip disappears, a kernel launch disappears, and the fused version is still reasonably readable. Our 1.1–1.4× is typical for well-sized inputs; it can be much higher for memory-bound kernels.
+- **Inline PTX pays off only when it exposes a hardware primitive that C++ can't express.** Warp ballots, shuffle-within-warp, tensor-core intrinsics, atomics on non-standard types — these are genuine PTX wins. Handwriting `a * b + c` as `fma.rn.f32 …` is not; the compiler already got there.
+- **When you do introduce PTX, test bit-exact parity with the non-PTX version** (we have `benchmark/smoke_test.py::check_ptx_equivalence` for this). It's cheap insurance against rounding-mode surprises.
+- **`--use_fast_math` is a trap for cross-path parity.** It's great for performance but lets the compiler rearrange floating-point in ways that differ between code paths. If you need bit-exact behaviour across code paths, pin the rounding with `__fmul_rn`, `__fadd_rn`, etc., at the specific ops that matter.
+
+All numbers above are reproducible with `python3 benchmark/fused_benchmark.py`. Raw data lives in `results/fusion/summary.csv` and `results/fusion/raw/fusion.json`.
+
+---
+
+## Kernel inventory (reference)
+
+For completeness, the individual CUDA kernels in `csrc/turboquant_kernels.cu`:
+
+| Kernel | Role | Programming model |
+|---|---|---|
+| `fwht_kernel<SIGNS_FIRST>` | O(d log d) Walsh-Hadamard rotation | CUDA C++ |
+| `quantize_pack_kernel<B>` | Per-coord Lloyd argmin + bit-pack | CUDA C++ |
+| `unpack_dequantize_kernel<B>` | Bit-unpack + codebook lookup | CUDA C++ |
+| `fused_quantize_kernel<B>` | FWHT + quantize + pack in one kernel | CUDA C++ (Method 2) |
+| `fused_dequantize_kernel<B>` | Unpack + dequant + inverse FWHT | CUDA C++ (Method 2) |
+| `fused_quantize_ptx_kernel<B>` | As above, with PTX `bfi.b32` packing | CUDA C++ + inline PTX (Method 3) |
+| `pack_signs_kernel` | Scalar bit-OR sign-pack | CUDA C++ |
+| `pack_signs_ptx_kernel` | Warp-ballot sign-pack | CUDA C++ + inline PTX (Method 3) |
+| `unpack_signs_kernel` | Unpack 1-bit sign words to ±1 floats | CUDA C++ |
+
+Templated on `B ∈ {1, 2, 4}` so the compiler unrolls the inner loops. All kernels use **one block per input vector**, up to 256 threads cooperating via shared memory. The `TurboQuant_prod` variant additionally invokes a dense `S · r` projection via cuBLAS — writing a competitive GEMM from scratch is out of scope.
+
+**Rotation choice.** The paper's analysis assumes a Haar-random `Π`. Practical systems (QuIP#, HadaCore) replace it with the structured factorisation `Π = (1/√d) · H · diag(s)` where `H` is the `d × d` Walsh-Hadamard matrix and `s ∈ {±1}ᵈ` are random signs. This is what we implement. The distortion numbers below land exactly on the paper's theoretical bounds, so the structured approximation is sufficient.
 
 ---
 

@@ -40,6 +40,9 @@ env/
 # Dataset caches (downloaded on demand)
 .cache/
 
+# Comparison subproject: external repo cloned on demand
+comparison/turboquant_cutile/
+
 
 # Claude Code
 .claude/
